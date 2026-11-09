@@ -323,55 +323,6 @@ window.__ModuleLoader__.load({
 
     /* ───────────── 媒体分析 ───────────── */
 
-    const seekTo = (video, time) =>
-      new Promise((resolve) => {
-        let settled = false
-        const done = () => {
-          if (settled) return
-          settled = true
-          video.removeEventListener('seeked', done)
-          resolve()
-        }
-        video.addEventListener('seeked', done)
-        setTimeout(done, 900)
-        try {
-          video.currentTime = time
-        } catch {
-          done()
-        }
-      })
-
-    const readFilmstrip = async (url) => {
-      const video = document.createElement('video')
-      video.muted = true
-      video.preload = 'auto'
-      video.src = url
-      const loaded = await new Promise((resolve) => {
-        video.addEventListener('loadeddata', () => resolve(true), { once: true })
-        video.addEventListener('error', () => resolve(false), { once: true })
-        setTimeout(() => resolve(video.readyState >= 2), 6000)
-      })
-      if (!loaded) return { frames: [], duration: 0 }
-      const duration = Number(video.duration) || 0
-      const canvas = document.createElement('canvas')
-      canvas.width = 168
-      canvas.height = 94
-      const context = canvas.getContext('2d')
-      const frames = []
-      const trackWidth = Math.max(820, Math.round(duration * 26))
-      const total = Math.max(6, Math.min(Math.ceil(trackWidth / 132), 32))
-      for (let index = 0; index < total; index += 1) {
-        await seekTo(video, duration > 0 ? (duration * (index + 0.5)) / total : 0)
-        try {
-          context.drawImage(video, 0, 0, canvas.width, canvas.height)
-          frames.push({ url: canvas.toDataURL('image/jpeg', 0.62) })
-        } catch {
-          frames.push({ url: '' })
-        }
-      }
-      video.removeAttribute('src')
-      return { frames, duration }
-    }
 
     const readWaveform = async (url) => {
       const response = await fetch(url)
@@ -470,6 +421,7 @@ window.__ModuleLoader__.load({
       const [fullscreen, setFullscreen] = useState(false)
       const [caps, setCaps] = useState({ images: true, known: false, modelName: undefined })
       const [pendingDelete, setPendingDelete] = useState(null)
+      const [createError, setCreateError] = useState('')
 
       const anchorRef = useRef(null)
       const pickedRef = useRef(false)
@@ -481,7 +433,10 @@ window.__ModuleLoader__.load({
       const playingRef = useRef(false)
       const lastPaintRef = useRef(0)
 
-      const outputRel = selectedOutput || project?.outputs?.[0]?.rel || ''
+      const outputList = project?.outputs ?? []
+      const outputRel = selectedOutput && outputList.some((item) => item.rel === selectedOutput)
+        ? selectedOutput
+        : outputList[0]?.rel ?? ''
       const showingOutput = Boolean(project && !preview && outputRel)
       const outputUrl = showingOutput ? api.media(project.name, outputRel) : ''
       const settings = project?.settings ?? { width: 1920, height: 1080, fps: 30, format: 'mp4', browser: 'auto' }
@@ -640,16 +595,27 @@ window.__ModuleLoader__.load({
         setDuration(0)
         setTime(0)
         setSelection(null)
-        if (!outputUrl) return undefined
+        if (!outputUrl || !project?.name || !outputRel) return undefined
         let active = true
-        const schedule = window.requestIdleCallback ?? ((run) => setTimeout(run, 600))
-        schedule(() => {
-          readFilmstrip(outputUrl).then((result) => {
+        const projectName = project.name
+        api
+          .get('thumbs', { name: projectName, rel: outputRel })
+          .then((data) => {
             if (!active) return
-            setFrames(result.frames)
-            if (result.duration) setDuration(result.duration)
+            setFrames(
+              (data?.frames ?? [])
+                .map((item) =>
+                  typeof item === 'string'
+                    ? { url: api.media(projectName, item) }
+                    : { url: item?.dataUrl ?? '' },
+                )
+                .filter((frame) => frame.url),
+            )
+            if (data?.error) setNote('缩略图生成失败：' + data.error)
+            if (data?.duration) setDuration(data.duration)
           })
-        })
+          .catch(() => {})
+        const schedule = window.requestIdleCallback ?? ((run) => setTimeout(run, 600))
         schedule(() => {
           readWaveform(outputUrl)
             .then((peaks) => {
@@ -811,17 +777,22 @@ window.__ModuleLoader__.load({
 
       const createProject = async () => {
         const name = newName.trim()
-        if (!name) return
+        if (!name) return setCreateError('请输入项目名称')
+        setCreateError('')
         setBusy('创建项目…')
-        const data = await api.post('project', { name })
-        setBusy('')
-        if (data?.error) return setError(data.error)
-        setNewName('')
-        setWorkspace(data.workspace ?? workspace)
-        setProject(data.project)
-        setDeps(data.deps ?? null)
-        pickedRef.current = true
-        loadProjects()
+        try {
+          const data = await api.post('project', { name })
+          if (data?.error) return setCreateError(data.error)
+          setNewName('')
+          setWorkspace(data.workspace ?? workspace)
+          pickedRef.current = true
+          await openProject(name)
+          await loadProjects()
+        } catch (error) {
+          setCreateError(String(error?.message ?? error))
+        } finally {
+          setBusy('')
+        }
       }
 
       const installDeps = async (kind) => {
@@ -934,15 +905,21 @@ window.__ModuleLoader__.load({
         video.play().catch(() => {})
       }
 
+      const absolutePath = (rel) => {
+        if (!project?.dir) return rel
+        const base = project.dir.replace(/[\\/]+$/, '')
+        return `${base}\\${String(rel).replace(/\//g, '\\')}`
+      }
+
       const injectSelection = (lane) => {
         if (!selection || !outputRel) return
         const from = Math.min(selection.start, selection.end)
         const to = Math.max(selection.start, selection.end)
-        addChip(
+        const head =
           lane === 'audio'
-            ? `[音频] ${outputRel} ${timecode(from)}–${timecode(to)}`
-            : `[视频] ${outputRel} ${timecode(from)}–${timecode(to)}（${fps}fps，第 ${Math.round(from * fps)}–${Math.round(to * fps)} 帧）`,
-        )
+            ? `[音频区间] ${outputRel} · ${timecode(from)}–${timecode(to)}`
+            : `[视频区间] ${outputRel} · ${timecode(from)}–${timecode(to)} · 第 ${Math.round(from * fps)}–${Math.round(to * fps)} 帧 @${fps}fps`
+        addChip(`${head}\n绝对路径：${absolutePath(outputRel)}`)
       }
 
       /* 派生值 */
@@ -1044,7 +1021,21 @@ window.__ModuleLoader__.load({
               : null,
             videoPreview ? h('div', { className: 'hf-time' }, h('b', null, timecode(time)), ' / ', timecode(duration)) : null,
             h('div', { className: 'hf-time', style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } }, preview.rel),
-            h('button', { className: 'hf-btn hf-btn-sm', onClick: () => addChip(`[素材] ${preview.rel}`) }, '注入到提示词'),
+            h(
+              'button',
+              {
+                className: 'hf-btn hf-btn-sm',
+                onClick: () => {
+                  const kind = preview.rel.includes('/images/')
+                    ? '素材/图片'
+                    : preview.rel.includes('/video/')
+                      ? '素材/视频'
+                      : '素材/音频'
+                  addChip(`[${kind}] ${preview.rel}\n绝对路径：${absolutePath(preview.rel)}`)
+                },
+              },
+              '注入到提示词',
+            ),
           )
         }
         if (!outputUrl) return null
@@ -1125,7 +1116,16 @@ window.__ModuleLoader__.load({
                   { className: 'hf-lane hf-lane-video', onPointerDown: startDrag },
                   frames.length === 0
                     ? h('div', { className: 'hf-lane-empty' }, '无缩略图')
-                    : frames.map((frame, index) => h('img', { key: index, src: frame.url, alt: '', draggable: false })),
+                    : frames.map((frame, index) =>
+                        h('img', {
+                          key: index,
+                          src: frame.url,
+                          alt: '',
+                          draggable: false,
+                          onError: () =>
+                            setNote('缩略图加载失败（' + String(frame.url).slice(0, 100) + '）'),
+                        }),
+                      ),
                   sel ? h('div', { className: 'hf-selection', style: sel }) : null,
                   sel ? h('div', { className: 'hf-selection-handle', style: { left: sel.left } }) : null,
                   sel ? h('div', { className: 'hf-selection-handle', style: { left: `calc(${sel.left} + ${sel.width} - 5px)` } }) : null,
@@ -1186,17 +1186,21 @@ window.__ModuleLoader__.load({
                 className: 'hf-input',
                 value: newName,
                 placeholder: '项目名称',
-                onChange: (event) => setNewName(event.target.value),
+                onChange: (event) => {
+                  setNewName(event.target.value)
+                  if (createError) setCreateError('')
+                },
                 onKeyDown: (event) => event.key === 'Enter' && createProject(),
               }),
               h('button', {
                 className: 'hf-iconbtn',
                 style: { background: 'var(--hf-accent)', color: '#fff' },
-                disabled: !newName.trim() || Boolean(busy),
+                disabled: Boolean(busy),
                 title: '新建项目',
                 onClick: createProject,
               }, h(PlusIcon)),
             ),
+            createError ? h('div', { className: 'hf-hint hf-warn', style: { padding: '0 12px 6px' } }, createError) : null,
             projects.map((item) =>
               renderRow({
                 key: item.name,
@@ -1429,7 +1433,7 @@ window.__ModuleLoader__.load({
 
       const sidebarTree = useMemo(
         () => renderSidebar(),
-        [projects, project, assets, compositions, preview, selectedOutput, newName, busy],
+        [projects, project, assets, compositions, preview, selectedOutput, newName, busy, createError],
       )
       const asideTree = useMemo(
         () => renderAside(),

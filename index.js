@@ -90,13 +90,21 @@ const STARTER_README = `# {{NAME}}
 
 HyperFrames 视频项目。
 
-## 目录
+## 目录约定
 
-- \`index.html\` — 主合成（composition），渲染入口
-- \`compositions/\` — 可复用的子合成
-- \`scripts/\` — 生成/处理脚本
-- \`assets/images/\` \`assets/video/\` \`assets/audio/\` — 素材
-- \`output/\` — 渲染产物（MP4）
+| 路径 | 用途 |
+| --- | --- |
+| \`index.html\` | 主合成（composition），渲染入口 |
+| \`compositions/\` | 可复用的子合成（被 data-composition-src 引用） |
+| \`assets/images/\` | 图片素材 |
+| \`assets/video/\` | 视频素材 |
+| \`assets/audio/\` | 音频素材 |
+| \`assets/fonts/\` | 字体文件 |
+| \`assets/vendor/\` | 第三方库（gsap 之类），不要用 CDN |
+| \`scripts/\` | 生成 / 批处理脚本，可重复运行 |
+| \`work/\` | 中间产物（抽帧、临时片段、截图），可随时删除 |
+| \`output/\` | 最终成片，只放 MP4 |
+| \`.cache/\` | 工作台缓存，不要读写 |
 
 ## 常用命令
 
@@ -443,7 +451,9 @@ export function apply(ctx) {
       if (assets[kind]) assets[kind].push(file)
     }
     const sources = files.filter(
-      (file) => classify(file.rel) === 'html' || file.rel.endsWith('.js') || file.rel.endsWith('.css'),
+      (file) =>
+        (classify(file.rel) === 'html' || file.rel.endsWith('.js') || file.rel.endsWith('.css')) &&
+        (!file.rel.includes('/') || file.rel.startsWith('compositions/')),
     )
     return { name, dir, meta, settings: readSettings(meta), outputs, assets, sources, files }
   }
@@ -481,7 +491,18 @@ export function apply(ctx) {
     const name = path.basename(dir)
     if (await statSafe(dir)) throw new Error(`项目「${name}」已存在`)
     await fs.mkdir(dir, { recursive: true })
-    for (const sub of ['compositions', 'scripts', 'assets/images', 'assets/video', 'assets/audio', 'output']) {
+    const dirs = [
+      'compositions',
+      'scripts',
+      'work',
+      'assets/images',
+      'assets/video',
+      'assets/audio',
+      'assets/fonts',
+      'assets/vendor',
+      'output',
+    ]
+    for (const sub of dirs) {
       await fs.mkdir(path.join(dir, sub), { recursive: true })
     }
     await fs.writeFile(path.join(dir, 'index.html'), STARTER_INDEX, 'utf8')
@@ -495,7 +516,7 @@ export function apply(ctx) {
       'utf8',
     )
     await fs.writeFile(path.join(dir, 'README.md'), STARTER_README.replaceAll('{{NAME}}', name), 'utf8')
-    for (const sub of ['assets/images', 'assets/video', 'assets/audio']) {
+    for (const sub of ['assets/images', 'assets/video', 'assets/audio', 'assets/fonts', 'assets/vendor', 'scripts', 'work']) {
       await fs.writeFile(path.join(dir, sub, '.gitkeep'), '', 'utf8')
     }
     return { workspaceDir, project: await listProject(dir, name) }
@@ -696,6 +717,61 @@ export function apply(ctx) {
     }
   }
 
+  const probeDuration = (file, ffmpegPath) =>
+    new Promise((resolve) => {
+      const binary = detectFfprobe(ffmpegPath) ?? 'ffprobe'
+      const probe = spawn(binary, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nk=1:nw=1', file], {
+        windowsHide: true,
+      })
+      let out = ''
+      probe.stdout?.on('data', (chunk) => {
+        out += String(chunk)
+      })
+      probe.on('error', () => resolve(0))
+      probe.on('close', () => resolve(Number.parseFloat(out) || 0))
+    })
+
+  const ensureThumbs = async (projectDir, rel, ffmpegPath) => {
+    const abs = path.resolve(projectDir, rel)
+    const stat = await statSafe(abs)
+    if (!stat) return { frames: [], duration: 0 }
+    const duration = await probeDuration(abs, ffmpegPath)
+    if (!duration) return { frames: [], duration: 0 }
+    const count = Math.max(6, Math.min(Math.ceil(Math.max(820, Math.round(duration * 26)) / 132), 32))
+    const key = `${path.basename(rel, path.extname(rel))}-${Math.floor(stat.mtimeMs)}-${count}`
+    const dir = path.join(projectDir, '.cache', 'thumbs', key)
+    const expected = Array.from({ length: count }, (_, index) => path.join(dir, `${index}.jpg`))
+    const toRel = (file) => path.relative(projectDir, file).replace(/\\/g, '/')
+    if (expected.every((file) => existsSync(file))) {
+      return { frames: expected.map(toRel), duration }
+    }
+    await fs.mkdir(dir, { recursive: true })
+    const produced = []
+    for (let index = 0; index < count; index += 1) {
+      const at = (duration * (index + 0.5)) / count
+      const target = path.join(dir, `${index}.jpg`)
+      await new Promise((resolve) => {
+        const job = spawn(
+          ffmpegPath,
+          [
+            '-y',
+            '-ss', String(at.toFixed(3)),
+            '-i', abs,
+            '-frames:v', '1',
+            '-vf', 'scale=168:94:force_original_aspect_ratio=decrease,pad=168:94:(ow-iw)/2:(oh-ih)/2:color=black',
+            '-q:v', '4',
+            target,
+          ],
+          { windowsHide: true },
+        )
+        job.on('error', resolve)
+        job.on('close', resolve)
+      })
+      if (existsSync(target)) produced.push(toRel(target))
+    }
+    return { frames: produced, duration }
+  }
+
   const sendToAgent = (sessionId, text) => {
     if (!text) return { ok: false, error: '内容为空' }
     const agents = ctx.get('agents')
@@ -724,29 +800,38 @@ export function apply(ctx) {
   const composeMessage = (payload) => {
     const text = String(payload.text ?? '').trim()
     const projectName = payload.name ? String(payload.name) : ''
-    // 纯发送：原样投递，不附加任何项目/规格/渲染指令
-    if (!projectName || payload.render === false) return text
-    const { workspaceDir, dir } = projectDirOf(payload.sessionId ?? '', projectName)
+    if (!projectName) return text
+    const { dir } = projectDirOf(payload.sessionId ?? '', projectName)
     const meta = readProjectMetaSync(dir)
     const settings = readSettings(meta)
     const browser = resolveBrowser(settings.browser)
-    const lines = [
-      text,
-      '',
-      `—— HyperFrames 工作台 · 项目「${projectName}」`,
-      `输出规格：${settings.width}×${settings.height} · ${settings.fps}fps · ${String(settings.format).toUpperCase()} · 渲染浏览器 ${browser.label}`,
-    ]
+    const outputDir = path.join(dir, 'output')
+    const block = [`—— HyperFrames 工作台 · 项目「${projectName}」`, `项目目录：${dir}`]
+
+    // 只发送：仅附项目上下文，不附加输出规格与渲染指令
     if (payload.render !== false) {
       const ext = settings.format === 'webm' ? 'webm' : 'mp4'
-      const outRel = `output/${stamp()}.${ext}`
-      lines.push(
-        '修改完成后渲染产出：',
-        `npx hyperframes render -o "${outRel}"`,
-        browser.path ? `渲染前设置 $env:HYPERFRAMES_BROWSER_PATH="${browser.path}"。` : '',
+      const outName = `${stamp()}.${ext}`
+      block.push(
+        `输出目录：${outputDir}`,
+        `输出规格：${settings.width}×${settings.height} · ${settings.fps}fps · ${String(settings.format).toUpperCase()} · 渲染浏览器 ${browser.label}`,
+        '渲染步骤（第一步必须先切到项目目录，产物只能落在上面的输出目录）：',
+        `Set-Location "${dir}"`,
+        `npx hyperframes render -o "output\\${outName}"`,
+      )
+      if (browser.path) block.push(`渲染前设置 $env:HYPERFRAMES_BROWSER_PATH="${browser.path}"。`)
+      block.push(
+        '目录约定（严格遵守，任何文件都不要丢在项目根目录）：',
+        '  合成：index.html 是主入口；子合成放 compositions\\*.html',
+        '  素材：图片 assets\\images\\、视频 assets\\video\\、音频 assets\\audio\\、字体 assets\\fonts\\、第三方库 assets\\vendor\\',
+        '  脚本：scripts\\（生成或批处理脚本，应能重复运行）',
+        '  中间产物：work\\（抽帧、临时片段、截图都放这里，可随时清理，不要放 output\\）',
+        '  成片：只放 output\\，文件名用 output\\<时间戳>.mp4，不要覆盖已有成片',
+        '  .cache\\ 由工作台维护，不要读写',
         '完成后返回产物路径。',
       )
     }
-    return lines.filter(Boolean).join('\n')
+    return [text, '', ...block].join('\n')
   }
 
   const readBody = (req) =>
@@ -954,6 +1039,24 @@ export function apply(ctx) {
         })
       }
 
+      if (action === 'thumbs') {
+        const { workspaceDir, dir } = projectDirOf(params.get('sessionId') ?? '', params.get('name'))
+        const rel = safeRel(params.get('rel'))
+        const ffmpeg = detectFfmpeg(dir, workspaceDir)
+        if (!ffmpeg) return sendJson(res, 200, { frames: [], duration: 0, error: 'FFmpeg 未安装' })
+        const result = await ensureThumbs(dir, rel, ffmpeg)
+        const frames = []
+        for (const frameRel of result.frames) {
+          try {
+            const data = await fs.readFile(path.join(dir, frameRel))
+            frames.push({ rel: frameRel, dataUrl: `data:image/jpeg;base64,${data.toString('base64')}` })
+          } catch {
+            /* skip unreadable frame */
+          }
+        }
+        return sendJson(res, 200, { frames, duration: result.duration })
+      }
+
       if (action === 'media') {
         const { dir } = projectDirOf(params.get('sessionId') ?? '', params.get('name'))
         const rel = safeRel(params.get('rel'))
@@ -964,6 +1067,8 @@ export function apply(ctx) {
 
       if (action === 'send' && req.method === 'POST') {
         const body = await readBody(req)
+        const composed = composeMessage(body)
+        if (body.dryRun) return sendJson(res, 200, { ok: true, preview: composed })
         const capability = await imageCapability(body.sessionId ?? '')
         if (capability.images === false) {
           return sendJson(res, 200, {
@@ -972,7 +1077,7 @@ export function apply(ctx) {
             error: `当前模型「${capability.modelName ?? capability.model}」不支持图片输入，已拒绝发送。请切换到支持视觉的模型。`,
           })
         }
-        return sendJson(res, 200, sendToAgent(body.sessionId ?? '', composeMessage(body)))
+        return sendJson(res, 200, sendToAgent(body.sessionId ?? '', composed))
       }
 
       if (action === 'capabilities') {
